@@ -1,0 +1,666 @@
+---
+title: "CS5801 Coursework Template Proforma"
+author: '2219246'
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+version: 1
+---
+
+
+```{r}
+library(validate)
+library(tidyverse)
+library(ggplot2)
+library(rpart.plot)
+```
+
+
+# 1. Organise and clean the data
+
+## 1.1 Subset the data into the specific dataset allocated
+ 
+```{r}
+SID <- 2219246  
+SIDoffset <- (SID %% 100) + 1
+
+load("house-analysis.RDa")
+
+mydf <- house.analysis[seq(from=SIDoffset,to=nrow(house.analysis),by=100),]
+```
+
+
+## 1.2 Data quality analysis
+
+The following points will be checked to assess the data quality:
+
+- What type of data are we working with? Are data types correct? Do the values make sense?
+
+- Are there erratic values? Are there more categories than expected for categorical variables?
+
+- Are there any missing values? How am I going to deal with them?
+
+First off, we can eyeball the data to answer the first question:
+
+```{r}
+View(mydf)
+```
+
+We can see at first sight that the row numbers are matched with the Id's. This should be changed immediately to avoid future complications. As it can be seen, the data frame includes 904 observations, therefore:
+
+```{r}
+rownames(mydf) <- c(1:904)
+```
+
+This way, every row is enumerated independently from the property ID. Now, the variable names can be simplified for convenience and faster coding, while maintaining the explainability of the names. Moreover, "mq" is an Italian term for "square meters", so it will be changed to "sqm":
+
+```{r}
+names(mydf)[3] <- "sqm"
+names(mydf)[5] <- "rooms"
+names(mydf)[6] <- "bathrooms"
+names(mydf)[7] <- "terrace"
+names(mydf)[8] <- "alarm"
+names(mydf)[9] <- "heating"
+names(mydf)[10] <- "ac"
+names(mydf)[11] <- "parking"
+names(mydf)[12] <- "furnished"
+```
+
+```{r}
+str(mydf)
+```
+The data set contains 904 rows and 12 columns. The "id" column is not relevant for our study. Further mistakes can be spotted: Firstly, categorical variables (which are all of them except for "price" and "sqm") are not considered as factors. Moreover, we can see that heating is considered as character, hinting at an error. We can begin by correcting the data types:
+
+```{r}
+mydf$floor <- as.factor(mydf$floor)
+mydf$rooms <- as.factor(mydf$rooms)
+mydf$bathrooms <- as.factor(mydf$bathrooms)
+mydf$terrace <- as.factor(mydf$terrace)
+mydf$alarm <- as.factor(mydf$alarm)
+mydf$heating <- as.factor(mydf$heating)
+mydf$ac <- as.factor(mydf$ac)
+mydf$parking <- as.factor(mydf$parking)
+mydf$furnished <- as.factor(mydf$furnished)
+```
+
+We can now take a deeper look into the data:
+
+```{r}
+summary(mydf)
+```
+Simply from looking at summary statistics more error can be easily pointed out: First, the minimum price seems odd, as 1000 is surprisingly cheap for a property, so might have to take a deeper look to determine if it is an imputation error. Secondly, the minimum value in "sqm" is 0, which does not make sense, so this value will be replaced with NA. Also, -1 rooms is not plausible, so it will be assumed it meant 1, previously checking the rest of the values for that row first. Lastly, there is a spelling mistake in heating, resulting in 3 factors instead of 2. On the other hand, the rest of the values look okay, but the mean is slightly different from the median in the continuous variables "price" and "sqm", which might produce skewness.
+
+The validate function is also usefull to check for further errors or extreme values, and this way confirm our previous findings in a visual way as well:
+
+```{r}
+mydf.rules <- validator(okHeating = is.element(heating,c("autonomous","other")),
+                             okPrice = price >= 5000, #Low value set by default to spot outliers
+                             okSqm = sqm >= 10, #Low value set by default to spot outliers
+                             okRooms = is.element(rooms,c(1,2,3,4,5)))
+
+
+qual.check <- confront(mydf,mydf.rules)
+summary(qual.check)
+barplot(qual.check, xlab = "")
+```
+
+These results confirm our previous observations. Moreover, there are 2 mistakes found in "sqm", not just 1. We can also explore the row for which "rooms" is -1:
+
+```{r}
+head(mydf[which(mydf$sqm<10), 1:12])
+head(mydf[which(mydf$rooms==-1), 1:12])
+```
+
+As seen, there are two properties with erratic values for "sqm", and the real value can not be deducted just by looking at the rest of the variables. It will be specified in the next section how these mistakes will be handled. Moreover, the property with -1 rooms points to an imputation error, as the value for "sqm" and "bathrooms" make sense.
+
+We can now start applying the different corrections to the data:
+
+```{r}
+#NB as I will start making modifications, a new df will be created (df) with the same content of the existing one, changing, replacing or deleting the content of the original df is a bad practice of data cleaning!
+
+#dropping the id column
+df <- subset(mydf, select = -c(id) ) 
+
+#price=1000 to NA
+df$price<-ifelse(df$price==1000,NA ,df$price)
+#then convert to numerical
+df$price<-as.numeric(df$price)
+
+#sqm=0 and sqm=1 to NA
+df$sqm<-ifelse(df$sqm==0,NA ,df$sqm)
+df$sqm<-ifelse(df$sqm==1,NA ,df$sqm)
+#then convert to numerical
+df$sqm<-as.numeric(df$sqm)
+
+#-1 in rooms to 1
+levels(df$rooms) <- c(1,2,3,4,5)
+
+#heating 3 levels to 2
+df[which(df$heating=="autonamous"), "heating"] <- "autonomous"
+df <- droplevels(df)
+```
+
+Now, we can check for NA's:
+
+```{r}
+summary(df)
+```
+
+As seen, there are 3 NA's (imputed in the previous steps). We know that there are no empty cells ("") or other values representing NA's ("?"), since we can check the variables types above, being all numeric (would not allow for character imputation) or categorical (would show the incorrect imputation as a new level).
+
+We can deal with NA's in different ways, like deleting those rows, however, I am going to impute different values with the hopes of obtaining a more robust model. Therefore, both for "price" and "sqm", the median value for that variable (meeting the requisites of same room and bathroom numbers) will be imputed. The median is chosen over the mean, as it is not as sensible to extreme values.
+
+```{r}
+head(df[which(is.na(df$price)), 1:11])
+head(df[which(is.na(df$sqm)), 1:11])
+```
+
+
+```{r}
+dummy_df <- df[-c(834), ] #Creating a dummy df just to calculate the median values dropping the rows containing NA
+dummy_df2 <- df[-c(399, 801),]
+
+#Imputing the median price
+df[834, "price"] <- median(dummy_df$price[dummy_df$rooms == 4 & dummy_df$bathrooms == 2 & dummy_df$sqm == 100])
+
+#Imputing the median sqm
+df[399, "sqm"] <- median(dummy_df2$sqm[dummy_df2$rooms == 2 & dummy_df2$bathrooms == 1])
+df[801, "sqm"] <- median(dummy_df2$sqm[dummy_df2$rooms == 4 & dummy_df2$bathrooms == 1])
+
+```
+
+Now we have a clean dataframe free of errors and missing values.
+
+## 1.3 Data cleaning  
+ 
+To sum up:
+
+- The variables' names were simplified, the row enumeration was corrected, and the "id" column was dropped as it does not provide valuable information. These changes help for easier manipulation of the data.
+
+- The categorical variables' types were incorrect: some were defined as numerical variables, some others as integers, and one of them as character, so the correct way to proceed was to define them as factors.
+
+- Specific mistakes were spotted: A minimum value for the variable "price" of 1000, two implausible values for "sqm" (0 and 1), an imputation error for "rooms" (-1), and lastly, a spelling mistake for one of the levels in "heating". Firstly, the values aforementioned of "price" and "sqm" were replaced by NA's temporarily. As these are the only NA's in the whole dataframe, the method chosen to deal with them was median imputation. Secondly, the value -1 for "rooms" is assumed to be an imputation error, and is corrected to 1, and lastly, the erratic level "autonamous" for "heating" has been turned into "autonomous".
+
+
+# 2. Exploratory Data Analysis (EDA)
+
+## 2.1 EDA plan
+
+For a complete EDA, the following steps will be followed:
+
+- What type of data do we have? Seen in the summary statistics portrayed previously.
+
+- How is each variable distributed? We need graphical visualization. For this, the distribution of the continuous numerical variables ("price" and "sqm") will be represented as histograms, while the categorical variables will be portrayed as frequency count barplots.
+
+- Is there correlation among variables? To address this, firstly, the dependent variable "price" will be studied against the other continuous numerical variable "sqm". Posteriorly, the relation of "price" with the categorical variables will be portrayed with boxplots, as they are an easy way to visually compare the differences between levels regarding means and IQRs.
+
+
+## 2.2 EDA and summary of results  
+
+We have 2 numerical variables ("price", "sqm"), and the rest of variables are considered categorical, as seen in the summary statistics before.
+
+Secondly, to visualize the distribution of the continuous variables:
+
+```{r}
+#price
+ggplot(df, aes(x=price)) + 
+  geom_histogram(aes(y=..density..),      
+                 #binwidth=1,
+                 colour="black", fill="light blue") +
+  geom_density(alpha=.2, fill="blue") +   
+  xlab("Price") +
+  ggtitle("Histogram and density plot of property price") +
+  theme_light()
+
+#sqm
+ggplot(df, aes(x=sqm)) + 
+  geom_histogram(aes(y=..density..),      
+                 #binwidth=1,
+                 colour="black", fill="light blue") +
+  geom_density(alpha=.2, fill="blue") +   
+  xlab("sqm") +
+  ggtitle("Histogram and density plot of property square meters") +
+  theme_light()
+```
+
+Neither looks normally distributed, and they both are positively skewed.
+
+For the categorical variables:
+
+```{r}
+#floor
+ggplot(df)+ geom_bar(aes(x=floor), colour="black", fill="light blue") +
+  labs(title = "Entrance floor") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#rooms
+ggplot(df)+ geom_bar(aes(x=rooms), colour="black", fill="light blue") +
+  labs(title = "Number of rooms") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#bathrooms
+ggplot(df)+ geom_bar(aes(x=bathrooms), colour="black", fill="light blue") +
+  labs(title = "Number of bathrooms") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#terrace
+ggplot(df)+ geom_bar(aes(x=terrace), colour="black", fill="light blue") +
+  labs(title = "Has terrace?") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#alarm
+ggplot(df)+ geom_bar(aes(x=alarm), colour="black", fill="light blue") +
+  labs(title = "Has alarm?") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#heating
+ggplot(df)+ geom_bar(aes(x=heating), colour="black", fill="light blue") +
+  labs(title = "Heating typer") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#ac
+ggplot(df)+ geom_bar(aes(x=ac), colour="black", fill="light blue") +
+  labs(title = "Has ac?") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#parking
+ggplot(df)+ geom_bar(aes(x=parking), colour="black", fill="light blue") +
+  labs(title = "Has parking?") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+
+#furnished
+ggplot(df)+ geom_bar(aes(x=furnished), colour="black", fill="light blue") +
+  labs(title = "Was the property sold furnished?") +
+  scale_y_continuous(name="Frequency") +
+  theme_light()
+```
+
+It can be seen how the categorical variables are, generally, unevenly distributed. The trend in "floor" shows that higher floors are less frequent. Also, the mode for the number of rooms is 3, and 1 for bathrooms. The rest of the distributions look very uneven.
+
+To test the correlation between numerical variables, "price" and "sqm", we should first test for normality. Visually, it did not seem they were normally distributed, but we can double-check with Shapiro's test for normality, being our hypothesis H0 the variable being normally distributed:
+
+```{r}
+shapiro.test(df$price)
+shapiro.test(df$sqm)
+```
+
+Both p-values are very small (<0.05) so we can reject the null hypothesis H0 and state that these variables are not normally distributed. Therefore, and to assess the correlation numerically, we will have to run a correlation test using Spearman's method:
+
+```{r}
+cor.test(df$price, df$sqm, method = "spearman")
+```
+
+There is a slight positive correlation (0.37) between both continuous variables. We can visually confirm this:
+
+```{r}
+ggplot(data=df, aes(x=sqm, y=price)) + geom_point() + theme_light() +
+  ggtitle("Scatter Plot for price vs sqm")
+```
+
+As seen, higher values of "sqm" correspond to higher values of "price", although this relationship is not very strong. From the graph above, it can be seen how for higher values, the variance increases drastically.
+
+Now we can study how the categorical variables covary with respect to the dependent variable "price":
+
+```{r}
+#floor vs price
+ggplot(df, aes(x=price, y=floor)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs entrance floor") +
+  coord_flip()
+
+#rooms vs price
+ggplot(df, aes(x=price, y=rooms)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs number of rooms") +
+  coord_flip()
+
+#bathrooms vs price
+ggplot(df, aes(x=price, y=bathrooms)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs number of bathrooms") +
+  coord_flip()
+
+#terrace vs price
+ggplot(df, aes(x=price, y=terrace)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs having terrace") +
+  coord_flip()
+
+#alarm vs price
+ggplot(df, aes(x=price, y=alarm)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs having alarm") +
+  coord_flip()
+
+#heating vs price
+ggplot(df, aes(x=price, y=heating)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs heating system") +
+  coord_flip()
+
+#ac vs price
+ggplot(df, aes(x=price, y=ac)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs having ac") +
+  coord_flip()
+
+#parking vs price
+ggplot(df, aes(x=price, y=parking)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs having parking") +
+  coord_flip()
+
+#furnished vs price
+ggplot(df, aes(x=price, y=furnished)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs being sold furnished") +
+  coord_flip()
+```
+
+A lot of valuable insight can be extracted from these visualizations. For example, it looks like The price of a property slightly increases with the number of rooms. Same thing happens with the number of bathrooms. Moreover, it looks like the mean price for those properties that have an alarm is significantly higher than the ones that do not, while for the rest of binary variables, the mean price does not seem to differ (this can be explained in part due to the uneven distribution of such variables).
+
+## 2.3 Additional insights and issues
+
+After a visual inspection of the relationship between variables, a few remarks come to mind regarding the validity of the data:
+
+- There are some categorical variables, like "alarm" or "parking", that are extremely unevenly distributed, which may make them almost useless, as they do not provide much information to build a robust model. 
+
+- Aligned with the previous statement, if we take a look at the boxplots, we can see a bast amount of outliers detected (dots on top of the whiskers of the boxes). These points might affect the outcome of a statistical model, but in this case, there is not much to do as we do not have further information from the source of the data, and getting rid of them would not be optimal.
+
+- Lastly, and with hopes of finding more meaningful insights, we can make fancier plots to better understand the distribution of the data:
+
+
+```{r}
+#sqm & n_rooms
+ggplot(data=df, aes(x=sqm, group=rooms, fill=rooms)) +
+    geom_density(adjust=1.5, alpha=.4)+
+    ggtitle("Scatter Plot for sqm vs rooms") +
+    theme_light()
+
+#price vs sqm & n_rooms
+ggplot(data=df, aes(x=sqm, y=price, )) + 
+  geom_point(aes(colour = factor(rooms))) + 
+  ggtitle("Scatter Plot for price vs sqm by rooms") +
+  theme_light()
+
+#price vs sqm & n_bathrooms
+ggplot(data=df, aes(x=sqm, y=price, )) + 
+  geom_point(aes(colour = factor(bathrooms))) + 
+  ggtitle("Scatter Plot for price vs sqm by bathrooms") +
+  theme_light()
+```
+
+The second plot represents the correlation between "price", "sqm" and "rooms". As seen, for higher values of "sqm" and "rooms", an increase in variability is detected. In other words, if we take a look at the houses with 1-3 rooms, we cans see they follow a linear relationship between "price" and "sqm", but houses with more than 3 rooms tend to have more variability on "sqm". Therefore, this leads to the following hypothesis: The majority of the properties on this data set look like apartments. Houses with a large "sqm" will most likely be bigger houses or villas in peripheral neighborhoods, leading to outliers. Thus, would getting rid of such properties (p. e. > 350 sqm) lead to a more robust model, that would explain a higher variability of the data set? This question will be answered in point 3.3.
+
+
+# 3. Modelling
+
+## 3.1 Explain your analysis plan
+
+Looking at the variable distributions from the EDA, and the summary statistics from the data cleaning, we now we have a continuous dependent variable, "price", and a mix of continuous and categorical explanatory variables. Therefore, the most suitable model would be ANCOVA Furthermore, to find the minimal adequate model, we will begin with the maximum model without interactions (since there are many explanatory variables), and the step function will be used to obtain the optimal number of explanatory variables.
+
+## 3.2 Build a model for property price
+
+Before proceeding with the modeling, the data is going to be split into train-test sets. This is a good machine learning practice, as it helps avoiding overfitting of the model. Since we are not using advanced machine learning algorithms, the train-test set will be helpful to determine the most significant coefficients in the train set, to later check the model summary in the test set.
+
+```{r}
+#The train-tes sets are sampled, being 80% of the data set used for training
+set.seed(1)
+row.number <- sample(1:nrow(df), 0.8*nrow(df))
+train = df[row.number,]
+test = df[-row.number,]
+dim(train)
+dim(test)
+```
+
+Now, the maximal model can be built:
+
+```{r}
+df.lm<-lm(price~sqm + floor + rooms +bathrooms + terrace + alarm + heating + ac + parking + furnished, data = train)
+summary(df.lm)
+```
+
+The model's performance does not look very promising. Although the F-statistic is significant (as it is greater than 1), the r-squared is still very low (0.19), thus it does not do a good job explaining the model's variance.
+
+```{r}
+plot(df.lm)
+```
+
+Only "sqm", "bathrooms", and "terrace" are significant. Moreover, exploring the residual plots, we can see in the first one how the variance of the residuals increases with the mean, in other words, heteroskedasticity occurs. This can lead to more problems and less accurate models, so one way of fixing this is applying a log transformation to the dependent variable "price" (this is possible as there can not be negative or null values for the price). Moreover, as "sqm" is a squared measurement, a transformation is going to be applied to this term. This way, we can start over the whole process: 
+
+```{r}
+df.lm2<-lm(log(price)~sqm + I(sqrt(sqm)) + floor + rooms +bathrooms + terrace + alarm + heating + ac + parking + furnished, data = train)
+summary(df.lm2)
+```
+
+In terms of performance, the transformations have not helped much.
+
+```{r}
+plot(df.lm2)
+```
+
+Now, after applying a log transformation, different results are obtained: The number of rooms becomes also significant. "Sqm" becomes slightly significant, while the square rooted "sqm" term is much more significant, thus the latter should be kept. Looking at the residuals, the first plot does not show further signs of heteroskedasticity. On the other hand, the QQ plot does not point to further issues, except for the data being skewed. There are also a couple of outliers spotted, but no further action will be performed at this point.
+
+Now, to obtain the minimal adequate model, the step function is applied:
+
+```{r}
+df.lm3<-step(df.lm2)
+summary(df.lm3)
+```
+
+The F-statistic remains significant, and the r-squared very low. Thus, we can conclude that the model's performance is not satisfactory and does not have enough explanatory power to accurately predict property price. On the other hand, we can confirm there is a statistical difference in the mean property price depending on the number of rooms, as well as in the number of bathrooms, and having a terrace.
+
+```{r}
+plot(df.lm3)
+```
+
+The residuals remain the same. The minimal adequate model is:
+
+$$log(price)= \sqrt sqm + rooms + bathrooms + terrace$$
+
+
+With the hopes of obtaining a more accurate model, we can take the variables selected by the minimal adequate model after applying the step function, and develop a new model with those variables and including interactions:
+
+```{r}
+df.lm4<-lm(log(price)~ I(sqrt(sqm)) * rooms * bathrooms * terrace, data = train)
+summary(df.lm4)
+```
+
+Although the model performance increases slightly (r2 = 0.22), there are not significant interactions, as shown in the summary above. To conclude, even if the model obtained is not a good predictor for property price, the ANCOVA model with the best performance is the one including square rooted "sqm", "rooms", "bathrooms" and "terrace", as well as interactions.
+
+Now, we can check the goodness of fit for the train set. 
+
+```{r}
+df.lm5<-lm(log(price)~ I(sqrt(sqm)) * rooms * bathrooms * terrace, data = test)
+summary(df.lm5)
+```
+
+Interestingly, some interactions become significant and the goodness of fit (r-squared) increases for the test sample. 
+
+```{r}
+plot(df.lm5)
+```
+
+There are no signs of heteroskedasticity, and the QQ plot doesn't point to further issues.
+
+## 3.3 Critique model using relevant diagnostics
+
+Summarizing the findings made in the previous point:
+
+- Since our data frame is composed of a mix of continuous and categorical variables, ANCOVA was the chosen model.
+
+- Using all variables, the model performance was very low (r2 = 0.19) and the residuals pointed at the need for transforming the dependent variable, as there were signs of heteroskedasticity. After performing a log transformation, the process was repeated, and the results showed that the F-statistic was still significant, but the performance remained almost the same (r2 = 0.20).
+
+- Following, the step function was applied to obtain the minimal adequate model. The model was left with square root of "sqm", "rooms", "bathrooms" and "terrace", but the r-squared did not vary much.
+
+- Lastly, interactions were applied in the minimal adequate model to hopefully increase the explanatory power. Although r-squared increased slightly (0.22), the performance remains very poor. Interestingly, the performance increased slightly for the test set. 
+
+
+## 3.4 Suggest improvements to your model
+
+As seen in the EDA, the uneven distributions for the binary variables do not provide much explanatory power. Furthermore, important information is missing from the dataframe in my opinion. Firstly, the area or neighborhood should be a factor included, as this could be a key factor when determining property price. Also, as mentioned previously, the property type should be addressed as well, to differ from apartments and bigger houses.
+
+It was previously hypothesized in 2.3 after looking at the scatter plots that higher values of "sqm" and "rooms" increased the variability of "price". This might be due to the following reason: neighborhoods in the peripheral areas of a city allow for bigger houses, with higher square meters and number of rooms, at a lower cost, while apartments in a central area of a city tend to be smaller, with higher prices. Thus, with the aim of obtaining a more robust model for apartment price prediction, let's try and build a model removing big houses (> 200 sqm). Although this hypothesis is very rudimentary (as it involves getting rid of many rows), the purpose is to see whether smaller sized apartments benefit the model performance.:
+
+```{r}
+df2 <- df[-c(which(df$sqm>200)), ]
+```
+
+```{r}
+df2.lm<-lm(log(df2$price)~df2$sqm + I(sqrt(df2$sqm)) + df2$floor + df2$rooms +df2$bathrooms + df2$terrace + df2$alarm + df2$heating + df2$ac + df2$parking + df2$furnished)
+summary(df2.lm)
+```
+
+
+```{r}
+df2.lm2<-step(df2.lm)
+summary(df2.lm2)
+```
+
+As seen, removing the bigger properties has not helped, as the performance is very low (r2 = 0.19), thus, the hypothesis previously stated is not supported by evidence.
+
+# 4. Extension work
+
+## 4.1 Model the likelihood of a property being furnished (using the is_furnished variable provided).
+
+Prior to modelling, some analysis and visualization has to be performed:
+
+- What is the exact amount for furnished houses?
+
+```{r}
+table(df$furnished)
+```
+
+As we had seen previously in the EDA section, the distribution is very uneven.
+
+- How is "furnished" distributed vs continuous numerical variables?
+
+Recall these plots from the EDA section:
+
+```{r}
+#furnished vs price
+ggplot(df, aes(x=price, y=furnished)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of price vs being sold furnished") +
+  coord_flip()
+
+#furnished vs sqm
+ggplot(df, aes(x=sqm, y=furnished)) +   
+  geom_boxplot(colour = "black", fill="lightblue") +
+  theme_light() +
+  labs(title="Box Plot of sqm vs being sold furnished") +
+  coord_flip()
+```
+
+In both plots many outliers can be observed, and there does not seem to be a difference in mean of "price" and "sqm" between furnished and not-furnished houses.
+EDA:
+
+- check how is "furnished" distributed vs categorical variables
+
+For this, we can simply portray contingency tables:
+
+```{r}
+#furnished vs floor
+table(Furnished = df$furnished, Rooms = df$floor)
+
+#furnished vs rooms
+table(Furnished = df$furnished, Bathrooms = df$bathrooms)
+
+#furnished vs terrace
+table(Furnished = df$furnished, Terrace = df$terrace)
+
+#furnished vs alarm
+table(Furnished = df$furnished, Alarm = df$alarm)
+
+#furnished vs heating
+table(Furnished = df$furnished, Heating = df$heating)
+
+#furnished vs ac
+table(Furnished = df$furnished, AC = df$ac)
+
+#furnished vs parking
+table(Furnished = df$furnished, Parking = df$parking)
+```
+
+We can see that the vast majority of properties were not sold furnished, skewing the distributions. For instance, only one property with parking was sold furnished, or only on property with 3 bathrooms. Thus, no clear insight can be taken from this.
+
+Now, the model can be presented. Since the dependent variable is binary, a logistic regression model will be applied. Note that the model will be trained with the training set, and later compared with the test set.
+
+```{r}
+furnished.glm<-glm(furnished ~ price + sqm + floor + rooms +bathrooms + terrace + alarm + heating + ac + parking, data = train, family = "binomial")
+summary(furnished.glm)
+```
+
+As see, the only significant variable to determine whether a house is sold furnished or not is having ac. In a way, this makes sense, as ac can be considered as part of the furniture when selling a house. Anyways, the step function is applied:
+
+```{r}
+furnished.glm2<-step(furnished.glm)
+summary(furnished.glm2)
+```
+
+As expected, the only significant coefficient is ac.
+
+```{r}
+exp(coef(furnished.glm2))
+```
+
+The odds of a house being sold furnished for ac = 1 are 3.26 - in other words they increase by a factor 3.26! Therefore, houses with ac had a strongly bigger chance of being sold furnished.
+
+Furthermore, with a chisquared test it can be proven whether there is a relationship between both variables. Thus, H0 will be both variables being independent:
+
+```{r}
+tab <- table(ac = df$ac,furnished = df$furnished)
+tab
+```
+
+```{r}
+chisq.test(tab)
+```
+
+We can see from this output that with a very small p-value that H0 can be rejected. There is technically relationship between the a house having ac and being sold furnished.
+
+Now, we can make predictions and check the accuracy:
+
+```{r}
+p1 <- predict(furnished.glm2, train, type = "response")
+```
+
+Probabilities of being furnished greater than 0.5 will be set to 1, and lower ones to 0:
+
+```{r}
+pred1 <- ifelse(p1 >= 0.5, 1, 0)
+```
+
+```{r}
+tab1 <- table(Predicted = pred1, Actual = train$furnished)
+tab1
+```
+
+As seen, the data is so unevenly distributed that there are no predicted probabilities above 0.5. This makes the model almost useless for predictions, as the accuracy will be very high due to the great number of ac = 0 in the data set. Therefore, the model has really very high sensitivity and extremely low specificity.
+
+```{r}
+acc <- sum(diag(tab1))/sum(tab1)
+acc
+```
+
+At this point, the same could be done to the test set, but the same thing would happen. Therefore, it can be concluded that, due to the nature of the data, the logistic regression model does not perform well and is not very accurate for predictions, despite the fact that having ac has been shown to be significant to determine whether a house is sold furnished.
